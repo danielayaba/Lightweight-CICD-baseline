@@ -1,0 +1,186 @@
+# ======================================================================================
+# Author: Daniel Kibombo Ayaba
+# Student ID: 2411626
+# Project: Design and Implementation of a Lightweight DevOps Pipeline for Small Projects
+# ======================================================================================
+#
+# Workflow reference: https://docs.github.com/en/actions
+#
+# This runs on every push to main. There's also a manual trigger with a
+# "fault_scenario" input, which I use to break the pipeline on purpose so I
+# can measure how long it takes to recover (dissertation, section 3.3).
+name: lightweight-cicd
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      fault_scenario:
+        description: "Inject a controlled failure to measure recovery (none | failing_test | broken_build | bad_deploy_credential)"
+        required: false
+        default: "none"
+        type: choice
+        options:
+          - none
+          - failing_test
+          - broken_build
+          - bad_deploy_credential
+
+# Start locked down: read-only by default, and open things up per job only
+# where a job actually needs it (see containerise-deploy).
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------
+  # LAYER 1 + 2: Build, Lint, Test (dissertation, section 3.9)
+  # ------------------------------------------------------------
+  build-test:
+    runs-on: ubuntu-latest
+    outputs:
+      # Hand the start time to the metrics job so it can work out how long
+      # the whole run took.
+      start_time: ${{ steps.timing.outputs.start }}
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Record the pipeline start time (execution-time metric)
+        id: timing
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (reproducible install)
+        run: npm ci || npm install
+
+      # One of the controlled faults: swap in a build script that just fails,
+      # so the build step breaks on cue. Only fires on a manual run with
+      # fault_scenario set to broken_build.
+      - name: Inject controlled fault (broken build)
+        if: ${{ github.event.inputs.fault_scenario == 'broken_build' }}
+        run: npm pkg set scripts.build="exit 1"
+
+      # Same idea for the test step: point the test script at a guaranteed
+      # failure when fault_scenario is failing_test.
+      - name: Inject controlled fault (failing test)
+        if: ${{ github.event.inputs.fault_scenario == 'failing_test' }}
+        run: npm pkg set scripts.test="exit 1"
+
+      # --if-present matters here: not every project has a lint or build
+      # script, and I don't want the run to fail just because one is missing.
+      # If it's there it runs, if not it's skipped.
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Test
+        run: npm test
+
+  # ------------------------------------------------------------------------------------------------------
+  # LAYER 3 + 4: Containerisation + Deployment to a single cloud host (Render) (dissertation, section 3.9)
+  # ------------------------------------------------------------------------------------------------------
+  containerise-deploy:
+    needs: build-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Log in to the GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      # Deployment goes through Render's deploy hook. The URL lives in an
+      # encrypted secret so it never shows up in the file or the logs.
+      #
+      # The third controlled fault (bad_deploy_credential) points at a URL
+      # that's deliberately wrong, so the deploy fails and I get a recovery
+      # time to measure.
+      - name: Trigger the Render deployment
+        id: deploy
+        run: |
+          if [ "${{ github.event.inputs.fault_scenario }}" = "bad_deploy_credential" ]; then
+            hook_url="https://api.render.com/deploy/srv-invalid-controlled-fault"
+          else
+            hook_url="${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+          fi
+          response=$(curl -s -o /dev/null -w "%{http_code}" "$hook_url")
+          echo "Render deploy hook HTTP status: $response"
+          if [ "$response" -ne 200 ]; then
+            echo "Deployment failed"
+            exit 1
+          fi
+
+  # ----------------------------------------------------------------------
+  # METRICS: its own job that runs no matter what, so a run that fails still
+  # leaves a record. Without this, the success rate would only ever count
+  # the runs that made it as far as deployment.
+  # ----------------------------------------------------------------------
+  record-metrics:
+    needs: [ build-test, containerise-deploy ]
+    # always() is the whole point: run even when an earlier job failed or was
+    # skipped, so every run — pass or fail — writes a metrics row.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute and write the run metrics
+        run: |
+          end_time=$(date +%s)
+          start_time="${{ needs.build-test.outputs.start_time }}"
+
+          # If build-test never even started, fall back to end_time so the
+          # duration comes out as 0 instead of blank or negative.
+          if [ -z "$start_time" ]; then
+            start_time="$end_time"
+          fi
+          duration=$((end_time - start_time))
+
+          # Collapse the two job results into one verdict for the run. It only
+          # counts as a successful deployment if both jobs came back green.
+          build_result="${{ needs.build-test.result }}"
+          deploy_result="${{ needs.containerise-deploy.result }}"
+          if [ "$build_result" = "success" ] && [ "$deploy_result" = "success" ]; then
+            deployment_success="1"
+          else
+            deployment_success="0"
+          fi
+
+          # Note down which fault was injected, if any, so I can tell the
+          # recovery runs apart from the normal ones later.
+          fault_scenario="${{ github.event.inputs.fault_scenario }}"
+          if [ -z "$fault_scenario" ]; then
+            fault_scenario="none"
+          fi
+
+          # These columns line up with docs/benchmark_dataset_template.csv, so
+          # a recorded run drops straight into the dataset.
+          echo "run_id,sha,deployment_success,execution_time_seconds,build_result,deploy_result,fault_scenario" > metrics.csv
+          echo "${{ github.run_id }},${{ github.sha }},$deployment_success,$duration,$build_result,$deploy_result,$fault_scenario" >> metrics.csv
+          cat metrics.csv
+
+      - name: Upload the metrics artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ github.run_id }}
+          path: metrics.csv
