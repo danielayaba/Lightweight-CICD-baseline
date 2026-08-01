@@ -237,7 +237,11 @@ jobs:
           last_age=""
           while [ "$(date +%s)" -lt "$deadline" ]; do
             elapsed=$(( $(date +%s) - TRIGGER_TS ))
-            body=$(curl -sf --max-time 15 "$SERVICE_URL/health" || true)
+            # 60s, not 15s: a spun-down free instance can take the better part
+            # of a minute to answer its first request. A 15s ceiling aborts
+            # mid-wake, so every poll would come back empty and the step would
+            # time out against a service that was in fact coming up.
+            body=$(curl -sf --max-time 60 "$SERVICE_URL/health" || true)
             uptime=$(printf '%s' "$body" | sed -n 's/.*"uptimeSeconds":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
             if [ -n "$uptime" ]; then
               started_at=$(( $(date +%s) - uptime ))
