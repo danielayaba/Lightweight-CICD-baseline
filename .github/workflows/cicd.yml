@@ -192,16 +192,40 @@ jobs:
             exit 1
           fi
 
-          if ! response=$(curl -s -o /dev/null -w "%{http_code}" "$hook_url"); then
+          # The response body matters as much as the status: a successful hook
+          # returns the id of the deploy it created. Checking only the status
+          # code accepts any URL that happens to answer 200 — the service's own
+          # URL, for one — and the run then spends the whole verification
+          # timeout waiting for a deployment that was never requested.
+          body_file=$(mktemp)
+          if ! status=$(curl -s -o "$body_file" -w "%{http_code}" "$hook_url"); then
             echo "::error::Could not reach the deploy hook — malformed URL or network failure."
             exit 1
           fi
+          body=$(cat "$body_file")
+          echo "Deploy hook HTTP status: $status"
 
-          echo "Render deploy hook HTTP status: $response"
-          if [ "$response" -ne 200 ]; then
-            echo "::error::Deploy hook returned HTTP ${response}, expected 200."
-            exit 1
-          fi
+          case "$status" in
+            200)
+              deploy_id=$(printf '%s' "$body" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+              if [ -z "$deploy_id" ]; then
+                echo "::error::The hook answered 200 but created no deploy — RENDER_DEPLOY_HOOK_URL is probably not a deploy hook. It must look like https://api.render.com/deploy/srv-XXXX?key=YYYY (Render -> your service -> Settings -> Deploy Hook), not the service's own URL."
+                printf 'First 200 bytes of the response: %.200s\n' "$body"
+                exit 1
+              fi
+              echo "Deploy ${deploy_id} created."
+              ;;
+            202)
+              # Documented case: another deploy is already running for this
+              # service, so no id comes back. The verification below still
+              # decides whether a new version reaches production.
+              echo "Another deploy is already in progress; verification will judge the outcome."
+              ;;
+            *)
+              echo "::error::Deploy hook returned HTTP ${status}, expected 200."
+              exit 1
+              ;;
+          esac
 
       # The hook returning 200 only means the deploy was *queued* — the host
       # builds the image afterwards, and the previous version keeps answering
