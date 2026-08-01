@@ -115,12 +115,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Container registries only accept lowercase repository names, and
+      # github.repository keeps whatever case the repo was created with. Any
+      # capital letter in the name makes buildx reject the tag outright, so the
+      # name is folded to lowercase here rather than assumed to be safe.
+      - name: Build the image name (registries require lowercase)
+        id: image
+        run: |
+          name=$(printf '%s' "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "Image name: ghcr.io/${name}"
+          echo "name=ghcr.io/${name}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push the Docker image
         uses: docker/build-push-action@v7
         with:
           context: .
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
 
       # Free hosts spin down when idle, so the first request after a quiet
       # period is slow. Probing before the deploy records whether this run
