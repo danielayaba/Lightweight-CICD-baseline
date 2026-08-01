@@ -83,10 +83,16 @@ recovery runs can be told apart from the natural runs.
 ├── package.json
 ├── eslint.config.js
 └── docs/
+    ├── pipeline_architecture.svg       # architecture diagram (source, vector)
+    ├── pipeline_architecture.png       # architecture diagram (2600×3800, for the write-up)
     ├── security_baseline.md            # security checklist (Objective 1)
     ├── benchmark_dataset_template.csv  # dataset template (Objective 3)
     └── evaluate.py                     # evaluation script (Objective 4)
 ```
+
+## Architecture
+
+![Pipeline architecture](docs/pipeline_architecture.png)
 
 ## Setup — step by step
 
