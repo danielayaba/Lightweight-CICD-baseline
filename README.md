@@ -114,7 +114,22 @@ Push this folder to a new GitHub repository.
 ### 3. Add the deploy hook as a GitHub secret
 In your GitHub repo: Settings → Secrets and variables → Actions → New repository secret.
 - Name: `RENDER_DEPLOY_HOOK_URL`
-- Value: the deploy hook URL from Render.
+- Value: the deploy hook URL from Render → Settings → Build & Deploy → Deploy Hook.
+
+This is **not** the service's public URL. A deploy hook looks like
+`https://api.render.com/deploy/srv-XXXX?key=YYYY` — note the `api.render.com` host and
+the `key` parameter. Pasting the service URL here is an easy mistake to make, because
+the two are configured on adjacent tabs of the same settings page, and it fails in a
+confusing way: the service answers 200 to any request, so the pipeline reads a success
+and then waits out its whole verification timeout for a deployment that was never
+requested. The workflow now guards against exactly this by requiring the hook's response
+to carry a deploy id, and says so when it does not.
+
+Treat the hook URL as a credential: anyone holding it can trigger deployments. If it
+leaks, regenerate it from the same Render settings page.
+
+Deploy hooks work with Auto-Deploy set to Off — Off disables the host's own git
+trigger, not the hook.
 
 ### 4. Add the service URL as a GitHub variable
 Same page, the **Variables** tab → New repository variable. The service URL is public
