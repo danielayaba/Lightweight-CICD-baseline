@@ -219,7 +219,12 @@ jobs:
           SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
           TRIGGER_TS: ${{ steps.deploy.outputs.trigger_ts }}
         run: |
-          timeout_seconds=600
+          # Free-tier hosts queue builds behind other tenants, so a cold Docker
+          # build can take well over ten minutes end to end. This is the ceiling
+          # on how long a deployment may take before the run is called failed —
+          # generous on purpose, because a timeout here is recorded as a failed
+          # deployment and would understate the success rate if set too tight.
+          timeout_seconds=1200
           poll_seconds=10
 
           if [ -z "$SERVICE_URL" ]; then
@@ -229,24 +234,38 @@ jobs:
           fi
 
           deadline=$(( $(date +%s) + timeout_seconds ))
+          last_age=""
           while [ "$(date +%s)" -lt "$deadline" ]; do
+            elapsed=$(( $(date +%s) - TRIGGER_TS ))
             body=$(curl -sf --max-time 15 "$SERVICE_URL/health" || true)
             uptime=$(printf '%s' "$body" | sed -n 's/.*"uptimeSeconds":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
             if [ -n "$uptime" ]; then
               started_at=$(( $(date +%s) - uptime ))
               if [ "$started_at" -ge "$TRIGGER_TS" ]; then
-                echo "New container is live (started ${started_at}, deploy triggered ${TRIGGER_TS})."
+                echo "New container is live after ${elapsed}s (uptime ${uptime}s)."
                 echo "live=yes" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
-              echo "Still the previous container (started ${started_at}); waiting..."
+              # How long before the deploy this container had already been
+              # running. A value that keeps growing means the host never
+              # replaced it, which is the signal worth seeing in the log.
+              last_age=$(( TRIGGER_TS - started_at ))
+              echo "[${elapsed}s] still the container that started ${last_age}s before the deploy; waiting..."
             else
-              echo "No usable /health response yet; waiting..."
+              echo "[${elapsed}s] no usable /health response yet; waiting..."
             fi
             sleep "$poll_seconds"
           done
 
-          echo "Timed out after ${timeout_seconds}s — the new version never served traffic."
+          echo "::error::No new container after ${timeout_seconds}s."
+          if [ -n "$last_age" ]; then
+            echo "The host kept serving a container that predates the deploy by ${last_age}s, so the"
+            echo "deploy hook was accepted but no replacement was rolled out. Check the host's"
+            echo "Events page: the build most likely failed, or it is still queued."
+          else
+            echo "/health never returned a usable uptimeSeconds value. Check that RENDER_SERVICE_URL"
+            echo "points at the right service and that the application exposes /health."
+          fi
           echo "live=no" >> "$GITHUB_OUTPUT"
           exit 1
 
