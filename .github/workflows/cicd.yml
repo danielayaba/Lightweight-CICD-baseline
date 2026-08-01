@@ -182,10 +182,24 @@ jobs:
           else
             hook_url="${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
           fi
-          response=$(curl -s -o /dev/null -w "%{http_code}" "$hook_url")
+
+          # An unset secret expands to an empty string, which makes curl exit 3
+          # ("URL malformed") and the step die with a bare exit code that says
+          # nothing about the cause. Naming the missing secret turns a cryptic
+          # failure into an actionable one.
+          if [ -z "$hook_url" ]; then
+            echo "::error::RENDER_DEPLOY_HOOK_URL is not set. Add it under Settings -> Secrets and variables -> Actions -> Secrets."
+            exit 1
+          fi
+
+          if ! response=$(curl -s -o /dev/null -w "%{http_code}" "$hook_url"); then
+            echo "::error::Could not reach the deploy hook — malformed URL or network failure."
+            exit 1
+          fi
+
           echo "Render deploy hook HTTP status: $response"
           if [ "$response" -ne 200 ]; then
-            echo "Deployment failed"
+            echo "::error::Deploy hook returned HTTP ${response}, expected 200."
             exit 1
           fi
 
