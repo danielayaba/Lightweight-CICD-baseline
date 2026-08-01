@@ -32,6 +32,12 @@ on:
 permissions:
   contents: read
 
+env:
+  # Identifies this application in the benchmarking dataset. The comparison
+  # applications reuse this same workflow with a different value here, so the
+  # recorded rows land in the right group when evaluate.py aggregates them.
+  APPLICATION_NAME: baseline-app
+
 jobs:
   # ------------------------------------------------------------
   # LAYER 1 + 2: Build, Lint, Test (dissertation, section 3.9)
@@ -90,6 +96,11 @@ jobs:
   containerise-deploy:
     needs: build-test
     runs-on: ubuntu-latest
+    outputs:
+      # Handed to the metrics job so the dataset records whether this run hit a
+      # sleeping host, and whether the deployment was actually observed live.
+      cold_start: ${{ steps.coldprobe.outputs.cold_start }}
+      live: ${{ steps.verify.outputs.live }}
     permissions:
       contents: read
       packages: write
@@ -111,6 +122,37 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
 
+      # Free hosts spin down when idle, so the first request after a quiet
+      # period is slow. Probing before the deploy records whether this run
+      # started against a sleeping host, which is what keeps cold starts
+      # separable from warm runs in the dataset (dissertation, section 3.5).
+      #
+      # The service URL is a repository *variable*, not a secret: it is public
+      # information, and only the deploy hook actually grants any capability.
+      - name: Probe the service before deploying (cold-start flag)
+        id: coldprobe
+        env:
+          SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+        run: |
+          # Above this many seconds, the first response is treated as a cold
+          # start. Fixed in advance, like the other thresholds in section 3.5.
+          threshold=5
+
+          if [ -z "$SERVICE_URL" ]; then
+            echo "RENDER_SERVICE_URL is not set — cold start not measured."
+            echo "cold_start=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if latency=$(curl -s -o /dev/null -w "%{time_total}" --max-time 120 "$SERVICE_URL/health"); then
+            flag=$(awk -v l="$latency" -v t="$threshold" 'BEGIN { print (l > t) ? 1 : 0 }')
+            echo "First-response latency ${latency}s (threshold ${threshold}s) -> cold_start=$flag"
+            echo "cold_start=$flag" >> "$GITHUB_OUTPUT"
+          else
+            echo "No answer from the service (first deploy?) — cold start not measured."
+            echo "cold_start=" >> "$GITHUB_OUTPUT"
+          fi
+
       # Deployment goes through Render's deploy hook. The URL lives in an
       # encrypted secret so it never shows up in the file or the logs.
       #
@@ -120,6 +162,10 @@ jobs:
       - name: Trigger the Render deployment
         id: deploy
         run: |
+          # Stamped before the request so the verification step below can tell
+          # a container started by *this* deploy from the one already running.
+          echo "trigger_ts=$(date +%s)" >> "$GITHUB_OUTPUT"
+
           if [ "${{ github.event.inputs.fault_scenario }}" = "bad_deploy_credential" ]; then
             hook_url="https://api.render.com/deploy/srv-invalid-controlled-fault"
           else
@@ -131,6 +177,53 @@ jobs:
             echo "Deployment failed"
             exit 1
           fi
+
+      # The hook returning 200 only means the deploy was *queued* — the host
+      # builds the image afterwards, and the previous version keeps answering
+      # 200 in the meantime. Without this step, deployment_success would record
+      # a 1 for a build that later failed, putting false positives into the
+      # primary reliability metric.
+      #
+      # /health reports the container's uptime, so a process that started after
+      # the deploy was triggered is evidence that the new version is serving.
+      # Waiting here is also what turns execution_time_seconds into a genuine
+      # commit-to-live lead time rather than a commit-to-triggered one.
+      - name: Wait for the new version to serve traffic (post-deploy verification)
+        id: verify
+        env:
+          SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+          TRIGGER_TS: ${{ steps.deploy.outputs.trigger_ts }}
+        run: |
+          timeout_seconds=600
+          poll_seconds=10
+
+          if [ -z "$SERVICE_URL" ]; then
+            echo "RENDER_SERVICE_URL is not set — deployment triggered but not verified."
+            echo "live=unverified" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          deadline=$(( $(date +%s) + timeout_seconds ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            body=$(curl -sf --max-time 15 "$SERVICE_URL/health" || true)
+            uptime=$(printf '%s' "$body" | sed -n 's/.*"uptimeSeconds":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+            if [ -n "$uptime" ]; then
+              started_at=$(( $(date +%s) - uptime ))
+              if [ "$started_at" -ge "$TRIGGER_TS" ]; then
+                echo "New container is live (started ${started_at}, deploy triggered ${TRIGGER_TS})."
+                echo "live=yes" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "Still the previous container (started ${started_at}); waiting..."
+            else
+              echo "No usable /health response yet; waiting..."
+            fi
+            sleep "$poll_seconds"
+          done
+
+          echo "Timed out after ${timeout_seconds}s — the new version never served traffic."
+          echo "live=no" >> "$GITHUB_OUTPUT"
+          exit 1
 
   # ----------------------------------------------------------------------
   # METRICS: its own job that runs no matter what, so a run that fails still
@@ -144,20 +237,58 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # Needed to count the configuration footprint below, straight from the
+      # repository rather than by hand.
+      - name: Check out the code
+        uses: actions/checkout@v7
+
+      # Metric 3 of the evaluation framework: how much configuration a project
+      # has to add to adopt this pipeline. Counted from the files themselves so
+      # the figure is reproducible and auditable instead of hand-tallied.
+      #
+      # Only the files the pipeline itself requires are counted. eslint.config.js
+      # is left out on purpose: the lint step runs with --if-present, so a
+      # project can adopt the pipeline without it.
+      - name: Measure the configuration footprint
+        id: footprint
+        run: |
+          files=0
+          lines=0
+          # Listed literally rather than through a variable: word splitting on
+          # an expanded variable behaves differently between shells, and this
+          # form has no such dependency.
+          for path in .github/workflows/cicd.yml Dockerfile .dockerignore; do
+            if [ -f "$path" ]; then
+              files=$((files + 1))
+              lines=$((lines + $(wc -l < "$path")))
+            fi
+          done
+          echo "Configuration footprint: $files file(s), $lines line(s)"
+          echo "config_files=$files" >> "$GITHUB_OUTPUT"
+          echo "config_lines=$lines" >> "$GITHUB_OUTPUT"
+
       - name: Compute and write the run metrics
         run: |
           end_time=$(date +%s)
           start_time="${{ needs.build-test.outputs.start_time }}"
 
-          # If build-test never even started, fall back to end_time so the
-          # duration comes out as 0 instead of blank or negative.
-          if [ -z "$start_time" ]; then
-            start_time="$end_time"
+          # If build-test never started, or its output did not propagate, the
+          # duration is left blank rather than written as 0. A zero would be a
+          # fabricated measurement, and evaluate.py averages every value it can
+          # parse — so zeros would quietly drag the execution-time mean down.
+          # A blank is skipped by the timing statistics while the run still
+          # counts towards the success rate, which is the honest treatment.
+          if [ -n "$start_time" ]; then
+            duration=$((end_time - start_time))
+          else
+            duration=""
           fi
-          duration=$((end_time - start_time))
 
           # Collapse the two job results into one verdict for the run. It only
-          # counts as a successful deployment if both jobs came back green.
+          # counts as a successful deployment if both jobs came back green —
+          # and containerise-deploy is green only once the new version has been
+          # observed serving traffic, so this reflects a deployment that really
+          # reached production, not one that was merely triggered.
           build_result="${{ needs.build-test.result }}"
           deploy_result="${{ needs.containerise-deploy.result }}"
           if [ "$build_result" = "success" ] && [ "$deploy_result" = "success" ]; then
@@ -173,10 +304,29 @@ jobs:
             fault_scenario="none"
           fi
 
-          # These columns line up with docs/benchmark_dataset_template.csv, so
-          # a recorded run drops straight into the dataset.
-          echo "run_id,sha,deployment_success,execution_time_seconds,build_result,deploy_result,fault_scenario" > metrics.csv
-          echo "${{ github.run_id }},${{ github.sha }},$deployment_success,$duration,$build_result,$deploy_result,$fault_scenario" >> metrics.csv
+          cold_start="${{ needs.containerise-deploy.outputs.cold_start }}"
+          live="${{ needs.containerise-deploy.outputs.live }}"
+          if [ -z "$live" ]; then
+            live="not-reached"
+          fi
+
+          # recovery_time_seconds is deliberately left blank: it spans two runs
+          # (the failure and the next success), so no single run can compute it.
+          # It gets filled in from the controlled fault scenarios, per 3.3.
+          recovery_time_seconds=""
+
+          # Diagnostics that have no column of their own go in notes, so the row
+          # stays exactly the shape evaluate.py expects while the run remains
+          # traceable. Quoted because the field contains commas.
+          notes="run ${{ github.run_id }}; sha ${{ github.sha }}; build ${build_result}; deploy ${deploy_result}; live ${live}"
+
+          # Same columns, same order as docs/benchmark_dataset_template.csv, so
+          # a recorded run can be appended to the dataset unchanged and read
+          # straight away by docs/evaluate.py.
+          {
+            echo "application,run_number,deployment_success,execution_time_seconds,config_files,config_lines,cold_start,recovery_time_seconds,fault_scenario,notes"
+            echo "${APPLICATION_NAME},${{ github.run_number }},${deployment_success},${duration},${{ steps.footprint.outputs.config_files }},${{ steps.footprint.outputs.config_lines }},${cold_start},${recovery_time_seconds},${fault_scenario},\"${notes}\""
+          } > metrics.csv
           cat metrics.csv
 
       - name: Upload the metrics artefact

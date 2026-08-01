@@ -12,10 +12,24 @@ function buildResponse() {
   });
 }
 
+// Health payload. uptimeSeconds is what makes post-deploy verification
+// possible: right after a deploy is triggered the *previous* version is still
+// answering 200, so a status code alone would confirm a deployment that has
+// not happened yet. A process that started after the deploy was triggered is
+// proof that a fresh container is serving. Deliberately derived from
+// process.uptime() rather than a host-specific variable, so the check works on
+// any target, not just Render.
+function buildHealth() {
+  return JSON.stringify({
+    status: 'healthy',
+    uptimeSeconds: Math.floor(process.uptime()),
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'healthy' }));
+    res.end(buildHealth());
     return;
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -29,4 +43,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, buildResponse };
+module.exports = { server, buildResponse, buildHealth };

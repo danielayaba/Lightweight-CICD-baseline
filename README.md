@@ -13,13 +13,33 @@ On every push to `main`, GitHub Actions runs three jobs:
 1. **build-test** — install dependencies, then lint, build (for TypeScript projects)
    and test with the native Node test runner.
 2. **containerise-deploy** — build a Docker image, push it to the GitHub Container
-   Registry (ghcr.io), then trigger a deployment to Render via a deploy hook.
+   Registry (ghcr.io), trigger a deployment to Render via a deploy hook, then wait
+   until the new version is actually serving traffic.
 3. **record-metrics** — always runs, even when an earlier job fails, and writes the
    run's metrics into a CSV artefact.
 
 Because the metrics job runs with `if: always()`, a failed run is recorded too, so the
 deployment success rate reflects failures rather than only the runs that reached
 deployment.
+
+### Why the pipeline waits for the deployment
+
+A deploy hook returns HTTP 200 as soon as the deployment is *queued*; the host builds
+the image afterwards, and the previous version keeps answering during that window.
+Treating the 200 as success would record a successful deployment for a build that later
+failed, putting false positives into the primary reliability metric.
+
+So `/health` reports the container's uptime, and the pipeline polls it until a process
+that started *after* the deploy was triggered answers. This makes `deployment_success`
+mean "the new version reached production", and `execution_time_seconds` a genuine
+commit-to-live lead time rather than a commit-to-triggered one. The check relies only on
+the application's own `/health`, not on any host-specific variable, so it works on any
+deployment target.
+
+Deployments are driven solely by the pipeline: Render's own Auto-Deploy is turned off
+(see setup below). Otherwise the host would deploy straight from a git push, in parallel
+with the pipeline and regardless of whether the tests passed — which would make the
+recorded success rate describe a quality gate that does not exist.
 
 ## The four metrics
 
@@ -29,7 +49,11 @@ The evaluation is built around four metrics (see the dissertation, section 3.4):
 - **Execution time** — pipeline duration, with cold-start runs separated from warm runs.
 - **Configuration footprint** — the files and lines a developer must add or change to
   adopt the pipeline. This is a limited proxy for adoption cost, not a direct measure
-  of usability.
+  of usability. Counted automatically from `.github/workflows/cicd.yml`, the
+  `Dockerfile` and `.dockerignore`, so the figure is reproducible rather than
+  hand-tallied. `eslint.config.js` is excluded: the lint step runs with `--if-present`,
+  so a project can adopt the pipeline without it. Raw line counts are used, comments
+  included.
 - **Recovery time** — the time for the pipeline to return to a successful deployment
   after a failure.
 
@@ -73,22 +97,45 @@ Push this folder to a new GitHub repository.
 1. Sign up at render.com (no credit card required for the free tier).
 2. New → Web Service → connect your GitHub repository.
 3. Render auto-detects the Dockerfile. Set the instance type to Free.
-4. Once created, go to Settings → Deploy Hook and copy the hook URL.
+4. Leave **Root Directory** empty — the Dockerfile is at the repository root.
+5. Leave **Environment Variables** empty. Render injects `PORT` itself, and the app
+   reads it; `NODE_ENV` is already set in the Dockerfile.
+6. Under Advanced, set **Auto-Deploy** to **Off**, so the pipeline is the only thing
+   that can deploy (see "Why the pipeline waits for the deployment" above).
+7. Under Advanced, set **Health Check Path** to `/health`.
+8. Once created, go to Settings → Deploy Hook and copy the hook URL.
 
 ### 3. Add the deploy hook as a GitHub secret
 In your GitHub repo: Settings → Secrets and variables → Actions → New repository secret.
 - Name: `RENDER_DEPLOY_HOOK_URL`
 - Value: the deploy hook URL from Render.
 
-### 4. Trigger the pipeline
+### 4. Add the service URL as a GitHub variable
+Same page, the **Variables** tab → New repository variable. The service URL is public
+information, so it is a variable rather than a secret; only the deploy hook grants any
+capability.
+- Name: `RENDER_SERVICE_URL`
+- Value: the service's URL, with no trailing slash (e.g. `https://your-app.onrender.com`).
+
+Without it the pipeline still deploys, but it cannot confirm the new version went live
+or record a cold start: the run is then marked `live unverified` in the metrics notes.
+
+### 5. Trigger the pipeline
 Push any commit to `main`, or use the "Run workflow" button (`workflow_dispatch`).
 Watch the run under the Actions tab.
 
-### 5. Collect metrics
-After each run, download the `metrics-<run_id>` artefact from the Actions run page and
-append the values to `docs/benchmark_dataset_template.csv`.
+### 6. Collect metrics
+After each run, download the `metrics-<run_id>` artefact from the Actions run page. Its
+columns are exactly those of `docs/benchmark_dataset_template.csv`, in the same order,
+so the row can be appended to the dataset unchanged.
 
-### 6. Evaluate
+Two columns are left blank on purpose. `recovery_time_seconds` spans two runs — the
+failure and the next success — so no single run can compute it; fill it in from the
+controlled fault scenarios. `execution_time_seconds` is blank when `build-test` never
+started, because a zero there would be a fabricated measurement that would drag the
+timing averages down.
+
+### 7. Evaluate
 Once the dataset has recorded runs, produce the summary:
 
 ```
@@ -102,8 +149,15 @@ For Objective 3, run the pipeline at least ten times against three applications:
 - two external open-source JavaScript/TypeScript apps (verify each builds in week 2).
 
 For each external app, copy `.github/workflows/cicd.yml`, the `Dockerfile`, and adjust
-the `start`/`test` scripts to match that project. Record the files and lines this takes
-as the configuration footprint for that application.
+the `start`/`test` scripts to match that project. Set `APPLICATION_NAME` at the top of
+the workflow to that application's name (`opensource-app-1`, `opensource-app-2`) so its
+rows land in the right group when `evaluate.py` aggregates the dataset. The
+configuration footprint is then counted automatically for that repository.
+
+The post-deploy verification expects the application to expose a `/health` endpoint
+returning `uptimeSeconds`, as `src/server.js` does. An application without it still
+deploys, but leave `RENDER_SERVICE_URL` unset for that repository so the run is recorded
+as `live unverified` rather than timing out.
 
 ## Local development
 
